@@ -2,7 +2,7 @@
 Broker de mensajeria entre agentes (Claude Code, Codex, OpenHands, ...) de distintas maquinas.
 
 Vive en una maquina siempre encendida. SQLite como ledger de mensajes: nunca se
-borran filas, solo cambian de estado. Auth por API key compartida (header X-API-Key).
+borran filas, solo cambian de estado. Auth por API key (header X-API-Key).
 
 Guardrails que vive ACA (server-side, no dependen del daemon que lo consume):
   - Un mensaje nunca lo puede tomar la misma maquina que lo mando (anti-loop
@@ -85,16 +85,77 @@ def init_db():
     conn.close()
 
 
+# --- Autenticacion por identidad ------------------------------------------------
+# KEYS_FILE: JSON {"identidad": "clave", ...}. Una clave identifica a UNA identidad: el broker
+# fija `de`/`maquina` segun la clave e ignora lo que diga el cliente. API_KEY (la clave compartida
+# historica) sigue valiendo mientras LEGACY_KEY=1 (compatibilidad); con LEGACY_KEY=0 se rechaza.
+KEYS_FILE = os.environ.get("MENSAJERIA_KEYS_FILE")
+LEGACY_KEY = os.environ.get("MENSAJERIA_LEGACY_KEY", "1") == "1"
+MAX_CUERPO = int(os.environ.get("MENSAJERIA_MAX_CUERPO", "32768"))
+RATE_POST_MIN = int(os.environ.get("MENSAJERIA_RATE_POST_MIN", "60"))
+ADMINS = tuple(x for x in os.environ.get("MENSAJERIA_ADMINS", "").split(",") if x)
+_keys_cache = {"mtime": None, "keys": {}}
+_posts_recientes = {}
+
+
+def _cargar_keys():
+    if not KEYS_FILE:
+        return {}
+    try:
+        mt = os.path.getmtime(KEYS_FILE)
+        if _keys_cache["mtime"] != mt:
+            import json
+            with open(KEYS_FILE) as f:
+                _keys_cache["keys"] = {k: v for k, v in json.load(f).items() if v}
+            _keys_cache["mtime"] = mt
+    except (OSError, ValueError):
+        return _keys_cache["keys"]
+    return _keys_cache["keys"]
+
+
+def _autenticar(clave):
+    """Devuelve (ok, identidad). identidad None = clave compartida legacy (confianza total)."""
+    import hmac
+    if not clave:
+        return False, None
+    for ident, k in _cargar_keys().items():
+        if hmac.compare_digest(clave, k):
+            return True, ident
+    if LEGACY_KEY and API_KEY and hmac.compare_digest(clave, API_KEY):
+        return True, None
+    return False, None
+
+
+def privilegiado():
+    """Legacy, humanos y admins pueden ver/operar sobre cualquier identidad."""
+    ident = getattr(g, "identidad", None)
+    return ident is None or ident in HUMANOS or ident in ADMINS
+
+
+def exigir_propia(valor):
+    """403 si una identidad autenticada intenta actuar en nombre de otra."""
+    if not privilegiado() and valor != g.identidad:
+        from flask import abort
+        abort(403, description="la clave pertenece a otra identidad")
+
+
 def require_api_key(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        if not API_KEY:
-            return jsonify(error="MENSAJERIA_API_KEY no configurada en el servidor"), 500
-        if request.headers.get("X-API-Key") != API_KEY:
+        if not API_KEY and not _cargar_keys():
+            return jsonify(error="ninguna clave configurada en el servidor"), 500
+        ok, ident = _autenticar(request.headers.get("X-API-Key"))
+        if not ok:
             return jsonify(error="API key invalida o ausente"), 401
+        g.identidad = ident
         return fn(*args, **kwargs)
 
     return wrapper
+
+
+@app.errorhandler(403)
+def _forbidden(e):
+    return jsonify(error=getattr(e, "description", "prohibido")), 403
 
 
 def now_iso():
@@ -121,8 +182,8 @@ def recuperar_tomados_vencidos(db):
 
 
 ALERTA_DE = "broker"
-# Identidades humanas (no reciben alertas por aca) + el propio broker (no alerta sobre sus alertas).
 HUMANOS = tuple(x for x in os.environ.get("MENSAJERIA_HUMANOS", "humano").split(",") if x)
+# El humano no recibe alertas por aca; el broker no alerta sobre sus alertas.
 SIN_ALERTA = (ALERTA_DE,) + HUMANOS
 
 
@@ -216,8 +277,25 @@ def crear_mensaje():
     data = request.get_json(force=True, silent=True) or {}
     de = data.get("de")
     cuerpo = data.get("cuerpo")
+    if g.identidad:
+        # La identidad la fija la clave, no el cliente (ni siquiera para admins/humanos).
+        if de and de != g.identidad:
+            return jsonify(error=f"esta clave es de '{g.identidad}', no puede enviar como '{de}'"), 403
+        de = g.identidad
     if not de or not cuerpo:
         return jsonify(error="'de' y 'cuerpo' son obligatorios"), 400
+    if len(str(cuerpo)) > MAX_CUERPO:
+        return jsonify(error=f"'cuerpo' supera {MAX_CUERPO} caracteres"), 413
+    # Rate limit por identidad (ventana de 60 s, por proceso).
+    import time as _t
+    from collections import deque
+    ahora_t = _t.time()
+    ventana = _posts_recientes.setdefault(g.identidad or "*", deque())
+    while ventana and ahora_t - ventana[0] > 60:
+        ventana.popleft()
+    if RATE_POST_MIN > 0 and len(ventana) >= RATE_POST_MIN:
+        return jsonify(error="demasiados mensajes por minuto"), 429
+    ventana.append(ahora_t)
 
     para = data.get("para")  # None = broadcast
     asunto = data.get("asunto")
@@ -274,6 +352,7 @@ def mensajes_pendientes():
     maquina = request.args.get("maquina")
     if not maquina:
         return jsonify(error="falta el parametro 'maquina'"), 400
+    exigir_propia(maquina)
     limite = min(int(request.args.get("limite", 5)), 20)
 
     db = get_db()
@@ -326,10 +405,12 @@ def marcar_fallido(mensaje_id):
     error = data.get("error", "")
 
     db = get_db()
-    cur = db.execute("SELECT intentos FROM mensajes WHERE id = ?", (mensaje_id,))
+    cur = db.execute("SELECT intentos, tomado_por FROM mensajes WHERE id = ?", (mensaje_id,))
     row = cur.fetchone()
     if row is None:
         return jsonify(error="mensaje no encontrado"), 404
+    if not privilegiado() and row["tomado_por"] != g.identidad:
+        return jsonify(error="solo quien tomo el mensaje puede marcarlo fallido"), 403
 
     intentos = row["intentos"] + 1
     nuevo_estado = "fallido" if intentos >= 3 else "pendiente"
@@ -351,12 +432,18 @@ def ver_hilo(hilo_id):
     cur = db.execute(
         "SELECT * FROM mensajes WHERE hilo_id = ? ORDER BY creado_en ASC", (hilo_id,)
     )
-    return jsonify(mensajes=[row_to_dict(r) for r in cur.fetchall()])
+    filas = [row_to_dict(r) for r in cur.fetchall()]
+    if not privilegiado() and not any(
+            g.identidad in (m["de"], m["para"]) or m["para"] is None for m in filas):
+        return jsonify(error="no participas de este hilo"), 403
+    return jsonify(mensajes=filas)
 
 
 @app.route("/api/mensajes/esperando_humano", methods=["GET"])
 @require_api_key
 def esperando_humano():
+    if not privilegiado():
+        return jsonify(error="solo humanos/admins"), 403
     db = get_db()
     cur = db.execute(
         "SELECT * FROM mensajes WHERE estado = 'esperando_humano' "
@@ -372,6 +459,7 @@ def esperando_humano():
 @app.route("/api/capacidades/<maquina>", methods=["PUT"])
 @require_api_key
 def publicar_capacidades(maquina):
+    exigir_propia(maquina)
     data = request.get_json(force=True, silent=True) or {}
     descripcion = data.get("descripcion")
     if not descripcion:
@@ -417,6 +505,7 @@ def registrar_invocacion():
         "exito", "fallido", "esperando_humano"
     ):
         return jsonify(error="faltan campos o 'resultado' invalido"), 400
+    exigir_propia(maquina)
 
     db = get_db()
     db.execute(
@@ -432,6 +521,8 @@ def registrar_invocacion():
 @require_api_key
 def listar_invocaciones():
     maquina = request.args.get("maquina")
+    if not privilegiado():
+        exigir_propia(maquina)
     db = get_db()
     if maquina:
         cur = db.execute(
@@ -472,6 +563,7 @@ def alertas():
     para = request.args.get("para")
     if not para:
         return jsonify(error="falta el parametro 'para'"), 400
+    exigir_propia(para)
     db = get_db()
     db.execute("BEGIN IMMEDIATE")
     try:
@@ -499,6 +591,8 @@ def recibo(mensaje_id):
     r = get_db().execute("SELECT * FROM mensajes WHERE id = ?", (mensaje_id,)).fetchone()
     if r is None:
         return jsonify(error="mensaje no encontrado"), 404
+    if not privilegiado() and g.identidad not in (r["de"], r["para"]):
+        return jsonify(error="no participas de este mensaje"), 403
     return jsonify(_recibo(r))
 
 
@@ -509,6 +603,7 @@ def enviados():
     de = request.args.get("de")
     if not de:
         return jsonify(error="falta el parametro 'de'"), 400
+    exigir_propia(de)
     limite = min(int(request.args.get("limite", 20)), 100)
     sql = "SELECT * FROM mensajes WHERE de = ?"
     if request.args.get("solo_sin_leer"):
@@ -527,6 +622,8 @@ def estado():
     para ver colgados), pendientes dirigidos a ella, y su ultima invocacion.
     Aparte: hilos esperando humano y totales por estado.
     """
+    if not privilegiado():
+        return jsonify(error="solo humanos/admins"), 403
     db = get_db()
     ahora = datetime.now(timezone.utc)
 

@@ -114,9 +114,26 @@ Demo sin agentes reales: `bash examples/quickstart.sh`.
 
 Tests: `cd broker && pytest` · `cd daemon && pytest`.
 
+## Modelo de amenazas (qué cubre y qué no)
+
+**Cubre**
+- Claves **por identidad** (`MENSAJERIA_KEYS_FILE`, gestión con `broker/gestionar_claves.py`): el broker fija `de`
+  según la clave, así que una identidad no puede hacerse pasar por otra. Con `MENSAJERIA_LEGACY_KEY=0` la clave
+  compartida deja de valer.
+- Mínimo privilegio: cada identidad solo lee su propia cola, publica solo sus propias capacidades, solo ve los hilos
+  en los que participa y solo puede marcar como fallidos los mensajes que ella tomó. Humanos y admins ven todo.
+- Comparación de claves en tiempo constante, tope de tamaño de cuerpo y rate limit por identidad.
+- Los mensajes de otros agentes se inyectan en el prompt **delimitados y marcados como datos**, no como órdenes.
+
+**No cubre**
+- No hay TLS propio: usalo sobre una red cifrada (tailnet, WireGuard) o detrás de un proxy TLS.
+- El aislamiento de prompts reduce, **no elimina**, la inyección de instrucciones: un agente engañado sigue
+  siendo el riesgo principal. Limitá sus herramientas (`MENSAJERIA_ALLOWED_TOOLS`) y el `WORKDIR`.
+- Las claves viven en archivos `.env`/JSON: protegelos (0600) y rotalas si dudás.
+
 ## Seguridad — leer antes de exponerlo
 
-- Una sola API key compartida: es un sistema para una red **de confianza** (p. ej. una tailnet). No lo publiques
+- Aun con claves por identidad, es un sistema para una red **de confianza** (p. ej. una tailnet). No lo publiques
   a Internet. Atá el broker a una IP privada (`MENSAJERIA_BIND_HOST`), nunca `0.0.0.0`.
 - El daemon ejecuta agentes de código. Empezá con herramientas mínimas (`MENSAJERIA_ALLOWED_TOOLS`) y sumá de a
   una. OpenHands en modo headless no tiene dial de permisos: acotá su `WORKDIR` y qué le asignás.

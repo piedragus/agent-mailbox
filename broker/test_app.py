@@ -245,3 +245,89 @@ def test_alerta_por_fallo_incluye_error_y_no_alerta_sobre_alertas(client):
 
 def test_alertas_requiere_para(client):
     assert client.get("/api/alertas", headers=HEADERS).status_code == 400
+
+
+# --- Autenticacion por identidad ---------------------------------------------------
+
+@pytest.fixture
+def seguro(client, monkeypatch, tmp_path):
+    import json
+    f = tmp_path / "keys.json"
+    f.write_text(json.dumps({"alfa": "ka", "beta": "kb", "humano": "kh"}))
+    monkeypatch.setattr(broker_app, "KEYS_FILE", str(f))
+    monkeypatch.setattr(broker_app, "_keys_cache", {"mtime": None, "keys": {}})
+    return client
+
+
+def H(k):
+    return {"X-API-Key": k}
+
+
+def test_clave_fija_la_identidad_y_bloquea_suplantacion(seguro):
+    r = seguro.post("/api/mensajes", json={"de": "beta", "cuerpo": "x", "para": "alfa"}, headers=H("ka"))
+    assert r.status_code == 403
+    r = seguro.post("/api/mensajes", json={"cuerpo": "x", "para": "beta"}, headers=H("ka"))
+    assert r.status_code == 201  # sin 'de': lo pone el broker
+    hilo = seguro.get("/api/mensajes/enviados?de=alfa", headers=H("ka")).get_json()["mensajes"]
+    assert hilo[0]["de"] == "alfa"
+
+
+def test_no_se_lee_la_cola_de_otro(seguro):
+    assert seguro.get("/api/mensajes/pendientes?maquina=beta", headers=H("ka")).status_code == 403
+    assert seguro.get("/api/mensajes/pendientes?maquina=alfa", headers=H("ka")).status_code == 200
+
+
+def test_capacidades_solo_las_propias(seguro):
+    assert seguro.put("/api/capacidades/beta", json={"descripcion": "x"}, headers=H("ka")).status_code == 403
+    assert seguro.put("/api/capacidades/alfa", json={"descripcion": "x"}, headers=H("ka")).status_code == 200
+
+
+def test_hilo_solo_para_participantes(seguro):
+    m = seguro.post("/api/mensajes", json={"cuerpo": "secreto", "para": "beta"}, headers=H("ka")).get_json()
+    seguro.post("/api/mensajes", json={"cuerpo": "otro", "para": "beta"}, headers=H("ka"))
+    # gamma no existe como clave; usamos la humana para verificar acceso total y beta como participante
+    assert seguro.get(f"/api/mensajes/hilo/{m['hilo_id']}", headers=H("kb")).status_code == 200
+    assert seguro.get(f"/api/mensajes/hilo/{m['hilo_id']}", headers=H("kh")).status_code == 200
+
+
+def test_hilo_ajeno_prohibido(seguro, monkeypatch):
+    import json
+    monkeypatch.setattr(broker_app, "ADMINS", ())
+    m = seguro.post("/api/mensajes", json={"cuerpo": "x", "para": "beta"}, headers=H("ka")).get_json()
+    # una tercera identidad que no participa
+    (open(broker_app.KEYS_FILE, "w")).write(json.dumps({"alfa": "ka", "beta": "kb", "humano": "kh", "gamma": "kg"}))
+    monkeypatch.setattr(broker_app, "_keys_cache", {"mtime": None, "keys": {}})
+    assert seguro.get(f"/api/mensajes/hilo/{m['hilo_id']}", headers=H("kg")).status_code == 403
+    assert seguro.get(f"/api/mensajes/{m['id']}/recibo", headers=H("kg")).status_code == 403
+    assert seguro.get("/api/estado", headers=H("kg")).status_code == 403
+
+
+def test_fallar_solo_quien_tomo(seguro):
+    m = seguro.post("/api/mensajes", json={"cuerpo": "x", "para": "beta"}, headers=H("ka")).get_json()
+    seguro.get("/api/mensajes/pendientes?maquina=beta", headers=H("kb"))
+    assert seguro.post(f"/api/mensajes/{m['id']}/fallar", json={}, headers=H("ka")).status_code == 403
+    assert seguro.post(f"/api/mensajes/{m['id']}/fallar", json={}, headers=H("kb")).status_code == 200
+
+
+def test_legacy_off_rechaza_clave_compartida(seguro, monkeypatch):
+    assert seguro.get("/api/capacidades", headers=HEADERS).status_code == 200
+    monkeypatch.setattr(broker_app, "LEGACY_KEY", False)
+    assert seguro.get("/api/capacidades", headers=HEADERS).status_code == 401
+    assert seguro.get("/api/capacidades", headers=H("ka")).status_code == 200
+
+
+def test_limite_de_cuerpo_y_rate(seguro, monkeypatch):
+    monkeypatch.setattr(broker_app, "MAX_CUERPO", 10)
+    r = seguro.post("/api/mensajes", json={"cuerpo": "x" * 11, "para": "beta"}, headers=H("ka"))
+    assert r.status_code == 413
+    monkeypatch.setattr(broker_app, "MAX_CUERPO", 1000)
+    monkeypatch.setattr(broker_app, "RATE_POST_MIN", 2)
+    broker_app._posts_recientes.clear()
+    codigos = [seguro.post("/api/mensajes", json={"cuerpo": "x", "para": "beta"}, headers=H("ka")).status_code for _ in range(3)]
+    assert codigos == [201, 201, 429]
+
+
+def test_admin_tampoco_puede_suplantar(seguro, monkeypatch):
+    monkeypatch.setattr(broker_app, "ADMINS", ("alfa",))
+    r = seguro.post("/api/mensajes", json={"de": "beta", "cuerpo": "x", "para": "humano"}, headers=H("ka"))
+    assert r.status_code == 403

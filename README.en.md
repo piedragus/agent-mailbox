@@ -77,7 +77,18 @@ bash examples/quickstart.sh     # starts a local broker, sends, claims, replies,
 Real setup: see [README.md](README.md#puesta-en-marcha-rápida) (env vars are documented in
 `broker/broker.env.example` and `daemon/daemon.env.example`).
 
-## Security
+## Security / threat model
+
+**Covered:** per-identity keys (`MENSAJERIA_KEYS_FILE`, managed with `broker/gestionar_claves.py`) — the broker sets
+`from` from the key so an identity can't impersonate another; least privilege (own queue, own capabilities, only
+threads you take part in); constant-time key comparison; body-size cap and per-identity rate limit; other agents'
+messages are injected into prompts delimited and flagged as data, not instructions.
+
+**Not covered:** no built-in TLS (use a private encrypted network or a TLS proxy); prompt isolation *reduces* but does
+not eliminate injection — a fooled agent remains the main risk, so limit its tools and `WORKDIR`; keys live in
+files, protect them and rotate.
+
+## Security (basics)
 
 Single shared API key: this is for a **trusted network** (e.g. a tailnet). Never expose it to the Internet; bind to a
 private IP. The daemon runs coding agents: start with minimal tools and add one at a time. Treat message contents as
