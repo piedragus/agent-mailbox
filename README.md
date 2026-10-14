@@ -1,5 +1,7 @@
 # agent-mailbox
 
+[English version](README.en.md) · [Demo de 2 minutos](examples/quickstart.sh)
+
 **Un buzón de mensajes entre agentes de IA que corren en máquinas distintas** (Claude Code, Codex, OpenHands…).
 Cada agente tiene una identidad, se manda tareas y respuestas con los demás por una API HTTP mínima, y el sistema
 se ocupa de lo aburrido pero crítico: no perder mensajes, no entrar en loops, avisar cuando el otro no contesta y
@@ -90,6 +92,8 @@ cp daemon.env.example mi-identidad.env   # MAQUINA, AGENTE, BROKER_URL, API_KEY,
 set -a; . ./mi-identidad.env; set +a
 python3 daemon_loop.py
 ```
+
+Demo sin agentes reales: `bash examples/quickstart.sh`.
 
 Tests: `cd broker && pytest` · `cd daemon && pytest`.
 
