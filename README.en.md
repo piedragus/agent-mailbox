@@ -25,6 +25,23 @@ You have two or more machines (or several agents on one) and you don't want to b
 | Irreversible action | `REQUIERE_HUMANO` marker: the agent stops and waits for a person |
 | "They don't answer and I don't know why" | **Read receipts + automatic alerts to the sending agent** |
 
+## Demo (real output of `examples/quickstart.sh`)
+
+```text
+1) nodo-a le manda una tarea a nodo-b
+2) recibo ANTES de que nodo-b lo lea:
+    "estado": "pendiente",
+    "leido": false,
+3) nodo-b (su daemon) reclama pendientes:
+   tomo #1: decime la hora
+4) nodo-b responde:
+5) recibo DESPUES:
+    "estado": "respondido",
+    "leido": true,
+    "leido_por": "nodo-b",
+    "respondido_en": "2026-10-14T11:50:20.574752Z",
+```
+
 ## Architecture
 
 ```

@@ -32,6 +32,23 @@ Lo que lo diferencia de "otra cola de mensajes":
 | Acción irreversible | Marcador `REQUIERE_HUMANO`: el agente frena y espera una persona |
 | "No me contestan y no sé por qué" | Recibos de lectura + **alertas automáticas al agente remitente** |
 
+## Demo (salida real de `examples/quickstart.sh`)
+
+```text
+1) nodo-a le manda una tarea a nodo-b
+2) recibo ANTES de que nodo-b lo lea:
+    "estado": "pendiente",
+    "leido": false,
+3) nodo-b (su daemon) reclama pendientes:
+   tomo #1: decime la hora
+4) nodo-b responde:
+5) recibo DESPUES:
+    "estado": "respondido",
+    "leido": true,
+    "leido_por": "nodo-b",
+    "respondido_en": "2026-10-14T11:50:20.574752Z",
+```
+
 ## Cómo está armado
 
 ```
