@@ -349,7 +349,21 @@ def parsear_asignacion(texto):
     return identidad, tarea
 
 
+def es_respuesta_automatica(mensaje):
+    """Una respuesta (responde_a_id) de otra identidad-agente no se vuelve a
+    contestar: evita cadenas "Re: Re: ..." entre daemons. Los humanos
+    (MENSAJERIA_HUMANOS) y los mensajes nuevos sí se atienden."""
+    humanos = {h.strip() for h in os.environ.get("MENSAJERIA_HUMANOS", "humano").split(",") if h.strip()}
+    return bool(mensaje.get("responde_a_id")) and mensaje.get("de") not in humanos
+
+
 def procesar_mensaje(mensaje, capacidades_todas):
+    if es_respuesta_automatica(mensaje):
+        _req("POST", "/api/invocaciones", body={
+            "maquina": MAQUINA, "mensaje_id": mensaje["id"],
+            "resultado": "exito", "resumen": "respuesta de agente: no se contesta",
+        })
+        return
     prompt = armar_prompt(mensaje, capacidades_todas)
     try:
         texto = invocar_agente(prompt)
